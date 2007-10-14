@@ -1,0 +1,6 @@
+Actions:
+	make help
+	make install
+	make uninstall
+Options:
+	DESTDIR - destition directory.

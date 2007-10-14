@@ -1,0 +1,327 @@
+#!/usr/bin/python
+# gvocab
+
+import pygtk
+pygtk.require('2.0')
+import gtk
+import gtk.glade
+import gtk.gdk
+import pango
+import threading
+import os
+import os.path
+import sys
+import random
+import xml.dom.minidom
+
+glade_file = 'ui.glade'
+words_file = 'sat-words.xml'
+session_file = os.path.join(os.getenv('HOME'), '.gnome2', 'gvocab', 'session.xml')
+
+NUM_FAKES = 4
+
+# Try-again is array of numbers. It should be an array of stacks to allow
+# relearning words at random distance.
+
+class InitThread(threading.Thread):
+
+	def __init__(self, callback, dictionary, status, progress):
+		threading.Thread.__init__(self)
+		self.dict_file_name = dictionary
+		self.result_callback = callback
+		self.status_label = status
+		self.progress_bar = progress
+
+	def run(self):
+		
+		gtk.gdk.threads_enter()
+		
+		self.status_label.set_text('Restoring session...')
+		self.progress_bar.set_fraction(0.0)
+		learned_words = []
+		if os.path.exists(session_file):
+			session = xml.dom.minidom.parse(session_file)
+			learned_word_elems = session.getElementsByTagName('learned')
+			num_learned = len(learned_word_elems)
+			for i in range(0, num_learned):
+				self.progress_bar.set_fraction(float(i)/float(num_learned))
+				learned_word_elem = learned_word_elems[i]
+				learned_word_elem.normalize()
+				learned_words.append(learned_word_elem.childNodes[0].nodeValue)
+			session.unlink()
+		
+		self.status_label.set_text('Reading dictionary...')
+		self.progress_bar.set_fraction(0.0)
+		dictionary = xml.dom.minidom.parse(self.dict_file_name)
+		defs = dictionary.getElementsByTagName('definition')
+		num_defs = len(defs)
+		new_mcs = []
+		old_mcs = []
+		typed_mcs = {}
+		for i in range(0, num_defs):
+			self.progress_bar.set_fraction(float(i)/float(num_defs))
+			definition = defs[i]
+			word_elem = definition.getElementsByTagName('word')[0]
+			type_elem = definition.getElementsByTagName('type')[0]
+			meaning_elem = definition.getElementsByTagName('meaning')[0]
+			word_elem.normalize()
+			type_elem.normalize()
+			meaning_elem.normalize()
+			w = word_elem.childNodes[0].nodeValue
+			t = type_elem.childNodes[0].nodeValue
+			m = meaning_elem.childNodes[0].nodeValue
+			mc = MultipleChoice( w, m, t )
+			if 0 == learned_words.count(w):
+				new_mcs.append(mc)
+			else:
+				old_mcs.append(mc)
+			for word_type in mc.word_type.split():
+				if not typed_mcs.has_key(word_type):
+					typed_mcs[word_type] = []
+				typed_mcs[word_type].append(mc)
+		dictionary.unlink()
+		
+		self.status_label.set_text('Shuffling questions...')
+		self.progress_bar.set_fraction(0.0)
+		random.shuffle(new_mcs)
+
+		self.status_label.set_text('Generating multiple choices...')
+		all_mcs = []
+		all_mcs.extend(old_mcs)
+		all_mcs.extend(new_mcs)
+		num_old_mcs = len(old_mcs)
+		num_all_mcs = len(all_mcs)
+		for i in range(num_old_mcs, num_all_mcs):
+			self.progress_bar.set_fraction(float(i)/float(num_all_mcs))
+			mc = all_mcs[i]
+			mc.fakes = []
+			# Use only the first word type here. Is this good enough?
+			word_type = mc.word_type.split()[0]
+			try:
+				random_mcs = random.sample(typed_mcs[word_type], NUM_FAKES)
+			except ValueError: # Very unique word type.
+				random_mcs = random.sample(all_mcs, NUM_FAKES)
+			for random_mc in random_mcs:
+				mc.fakes.append( random_mc.meaning )
+
+		self.status_label.set_text('')
+		self.progress_bar.set_fraction(0.0)
+
+		gtk.gdk.threads_leave()
+
+		self.result_callback(all_mcs, len(old_mcs))
+
+class SaveSessionThread(threading.Thread):
+
+	def __init__(self, done_callback, answered_mcs, status_label, progress_bar):
+		threading.Thread.__init__(self)
+		self.callback = done_callback
+		self.mcs = answered_mcs
+		self.status = status_label
+		self.progress = progress_bar
+		
+	def run(self):
+		gtk.gdk.threads_enter()
+		self.status.set_text('Saving session...')
+		self.progress.set_fraction(0.0)
+		if not os.path.exists(session_file):
+			try:
+				os.makedirs(os.path.dirname(session_file))
+			except:
+				print 'Failed to create directory '+os.path.dirname(session_file)
+				self.callback()
+		fd = open(session_file, 'w')
+		fd.write('<session>\n')
+		num_mcs = len(self.mcs)
+		for i in range(0, num_mcs):
+			self.progress.set_fraction(float(i)/float(num_mcs))
+			fd.write('\t<learned>'+self.mcs[i].word+'</learned>\n')
+		fd.write('</session>\n')
+		fd.close()
+		self.progress.set_fraction(0.0)
+		self.status.set_text('')
+		gtk.gdk.threads_leave()
+		self.callback()
+
+class Test:
+
+	position = 0
+	mcs = []
+	try_again = []
+	learned = []
+
+	radio_buttons    = []
+	invisible_button = None
+	status_label     = None
+	progress_bar     = None
+	word_type_label  = None
+	word_label       = None
+	query_box        = None
+	choices_box      = None
+
+	EMPTY = -1
+	TRY_AGAIN_STEP = 5
+
+	def __init__(self, dictionary):
+
+		gtk.gdk.threads_init()
+
+		if not os.path.exists(glade_file):
+			print 'Failed to open '+glade_file+'.'
+			sys.exit(1)
+
+		ui = gtk.glade.XML(glade_file)
+		
+		self.choices_box     = ui.get_widget('choices')
+		self.query_box       = ui.get_widget('query')
+		self.word_type_label = ui.get_widget('word_type')
+		self.word_label      = ui.get_widget('word')
+		self.status_label    = ui.get_widget('status')
+		self.progress_bar    = ui.get_widget('progress')
+		
+		init_thread = InitThread(self.init_complete, dictionary, self.status_label, self.progress_bar)
+		init_thread.start()
+
+		self.word_type_label.set_text('')
+		self.word_label.set_text('')
+		self.query_box.set_sensitive(False)
+		self.choices_box.set_sensitive(False)
+		self.invisible_button = gtk.RadioButton(group=None, label='You should not see this.')
+		for i in range(0, NUM_FAKES+2):
+			rb = gtk.RadioButton(group=self.invisible_button, label='')
+			rb.connect("toggled", self._choose, i+1)
+			self.radio_buttons.append(rb)
+			self.choices_box.pack_start(rb)
+		
+		window = ui.get_widget('window')
+		window.connect('destroy', self.exit)
+		window.show_all()
+		
+		gtk.main()
+	
+	def exit(self, widget):
+		save_thread = SaveSessionThread(gtk.main_quit, self.learned, self.status_label, self.progress_bar)
+		save_thread.start()
+	
+	def init_complete(self, questions, pos):
+		self.position = pos
+		self.mcs = questions
+		self.learned = self.mcs[:self.position]
+		self.query_box.set_sensitive(True)
+		self.choices_box.set_sensitive(True)
+		for i in range(0, 100+len(self.mcs)):
+			self.try_again.append(self.EMPTY)
+		self._show_mc()
+	
+	def _show_mc(self):
+		try:
+			mc = self.mcs[self._get_current_position()]
+		except IndexError:
+			print "You're done!"
+			self.exit()
+			return
+		self.progress_bar.set_fraction(float(self.position)/float(len(self.mcs)))
+		self.progress_bar.set_text(str(self._get_current_position()+1)+'/'+str(len(self.mcs)))
+		self.word_type_label.set_text(mc.word_type)
+		self.word_label.set_markup('<b>'+mc.word+'</b>')
+		answers = mc.get_possible_answers()
+		num_answers = len(answers)
+		for i in range(0, num_answers):
+			self.radio_buttons[i].set_label(answers[i])
+		self.radio_buttons[len(self.radio_buttons)-1].set_label('I don\'t know')
+		self.invisible_button.set_active(True)
+	
+	def _choose(self, widget, choice):
+		if widget.get_active():
+			mc = self.mcs[self._get_current_position()]
+			if mc.correct_answer == choice:
+				self.status_label.set_text('Correct! "'+mc.word+'" means "'+mc.meaning+'"')
+				if 0 == mc.mistakes:
+					self.learned.append(mc)
+				# We are moving away from this question, so
+				# let's forget all our misunderstandings:
+				mc.mistakes = 0
+				if self.try_again[self.position] != self.EMPTY:
+					self.try_again[self.position] = self.EMPTY
+				else:
+					self.position += 1
+				self._show_mc()
+			else:
+				self.try_again[self.position+self.TRY_AGAIN_STEP] = self.position
+				mc.mistakes += 1
+				if choice == NUM_FAKES+2: # User clicked "I don't know"
+					self.status_label.set_text('Answer: "'+mc.word+'" means "'+mc.meaning+'"')
+					label = self.radio_buttons[mc.correct_answer-1].child
+					label.set_markup('<b>'+label.get_text()+'</b>')
+				else:
+					label = self.radio_buttons[choice-1].child
+					label.set_markup('<span strikethrough="true">'+label.get_text()+'</span>')
+
+	def _get_current_position(self):
+		if self.try_again[self.position] == self.EMPTY:
+			return self.position
+		else:
+			return self.try_again[self.position]
+
+
+class MultipleChoice:
+	word = ""
+	word_type = ""
+	meaning = ""
+	fakes = []
+	mistakes = 0
+	correct_answer = -1
+	def __init__(self, word, meaning, word_type="", fakes=[]):
+		self.word = word
+		self.meaning = meaning
+		self.word_type = word_type
+		self.fakes.extend(fakes)
+	
+	def _format(self, num, choice):
+		return '('+str(num)+') '+choice
+
+	def get_possible_answers(self):
+		answers = []
+		self.correct_answer = -1
+		if 0 == len(self.fakes):
+			self.correct_answer = 1
+			answers.append(self.meaning)
+		else:
+			r = random.randint(0, len(self.fakes))
+			random.shuffle(self.fakes)
+			for i in range(0, len(self.fakes)):
+				if i == r:
+					self.correct_answer = i+1
+					answers.append(self.meaning)
+				answers.append(self.fakes[i])
+			if self.correct_answer == -1:
+				answers.append(self.meaning)
+				self.correct_answer = len(self.fakes)+1
+		return answers
+
+	def show(self):
+		self._show(self.get_possible_answers())
+
+	def _show(self, answers):
+		print self.word_type+' '+self.word+':'
+		num_answers = len(answers)
+		for i in range(0, num_answers):
+			print self._format((i+1), answers[i])
+		
+	def ask(self):
+		self.show()
+		print 'Your answer: ',
+		answer = sys.stdin.readline()
+		if correct_answer == int(answer):
+			print 'Number', str(int(answer)), 'is correct!'
+			return True
+		else:
+			print 'No, the right answer is', str(correct_answer)+'.'
+			print 'The word "'+self.word+'" means "'+self.meaning+'"'
+			return False
+
+if __name__ == '__main__':
+	dict_file = words_file
+	if len(sys.argv) > 1:
+		dict_file = sys.argv[1]
+	test = Test(dict_file)
