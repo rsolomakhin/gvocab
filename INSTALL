@@ -3,4 +3,4 @@ Actions:
 	make install
 	make uninstall
 Options:
-	DESTDIR - destition directory.
+	DESTDIR - destition directory. [/home/you]
