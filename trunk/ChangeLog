@@ -1,0 +1,10 @@
+2007-10-09
+	* gvocab: Added session tracking via ~/.gnome/gvocab/session.xml.
+	          Further improvements to start up times.
+
+2007-10-08
+	* gvocab: Improved startup time by using a separate thread for reading
+	  the dictionary.
+
+2007-10-07
+	* gvocab: Made installable and uninstallable via Makefile.
