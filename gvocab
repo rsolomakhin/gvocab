@@ -247,7 +247,7 @@ class Test:
 					self.position += 1
 				self._show_mc()
 			else:
-				self.try_again[self.position+self.TRY_AGAIN_STEP] = self.position
+				self.try_again[self.position+self.TRY_AGAIN_STEP] = self._get_current_position()
 				mc.mistakes += 1
 				if choice == NUM_FAKES+2: # User clicked "I don't know"
 					self.status_label.set_text('Answer: "'+mc.word+'" means "'+mc.meaning+'"')
