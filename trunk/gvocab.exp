@@ -1,0 +1,269 @@
+#!/usr/bin/python
+# gvocab
+
+import pygtk
+pygtk.require('2.0')
+import gtk
+import gtk.glade
+import gtk.gdk
+import pango
+import threading
+import os
+import os.path
+import sys
+import random
+import xml.dom.minidom
+
+glade_file = 'ui.glade'
+words_file = 'sat-words.xml'
+session_file = os.path.join(os.getenv('HOME'), '.gnome2', 'gvocab', 'session.xml')
+
+NUM_FAKES = 4
+
+# Try-again is array of numbers. It should be an array of stacks to allow
+# relearning words at random distance.
+
+# Buffer monitor assumes that python conditions are release and continue.
+class BufferMonitor:
+	def __init__(self):
+		self.buf = []
+		self.not_empty = threading.Condition()
+	def append(self, item):
+		self.not_empty.acquire()
+		self.buf.append(item)
+		self.not_empty.notify()
+		self.not_empty.release()
+	def insert(self, position, item):
+		self.not_empty.acquire()
+		self.buf.insert(position, item)
+		self.not_empty.notify()
+		self.not_empty.release()
+	def get(self, position):
+		self.not_empty.acquire()
+		while len(self.buf) <= position:
+			self.not_empty.wait()
+		self.not_empty.release()
+		return self.buf[position]
+	def remove(self, position):
+		self.not_empty.acquire()
+		while len(self.buf) <= position:
+			self.not_empty.wait()
+		self.not_empty.notify()
+		self.not_empty.release()
+		return self.buf.pop(position)
+	def length(self):
+		return len(self.buf)
+	def random_sample(self, num_items):
+		self.not_empty.acquire()
+		while len(self.buf) < num_items:
+			self.not_empty.wait()
+		self.not_empty.release()
+		return random.sample(self.buf, num_items)
+	def contains(self, item):
+		return (self.buf.count(item) > 0)
+
+class ReadSession(threading.Thread):
+	def __init__(self, session_file, session_buffer):
+		threading.Thread.__init__(self)
+		self.buffer = session_buffer
+		self.file = session_file
+	def run(self):
+		if os.path.exists(self.file):
+			session = xml.dom.minidom.parse(self.file)
+			learned_word_elems = session.getElementsByTagName('learned')
+			for i in range(0, len(learned_word_elems)):
+				learned_word_elem = learned_word_elems[i]
+				learned_word_elem.normalize()
+				self.buffer.append(learned_word_elem.childNodes[0].nodeValue)
+				if 0 == i%500:
+					print 'read', i, 'words in session'
+			session.unlink()
+			print 'finished reading session'
+		else:
+			print 'Session file', self.file, 'not found'
+
+class ReadDictionary(threading.Thread):
+	def __init__(self, dictionary_file, dictionary_buffer, progress_bar):
+		threading.Thread.__init__(self)
+		self.dict = dictionary_buffer
+		self.file = dictionary_file
+		self.progress = progress_bar
+	def run(self):
+		if os.path.exists(self.file):
+			dictionary = xml.dom.minidom.parse(self.file)
+			defs = dictionary.getElementsByTagName('definition')
+			num_defs = len(defs)
+			for i in range(0, num_defs):
+				if 0 == i%500:
+					self.progress.set_fraction(float(i)/float(num_defs));
+				definition = defs[i]
+				word_elem = definition.getElementsByTagName('word')[0]
+				type_elem = definition.getElementsByTagName('type')[0]
+				meaning_elem = definition.getElementsByTagName('meaning')[0]
+				word_elem.normalize()
+				type_elem.normalize()
+				meaning_elem.normalize()
+				w = word_elem.childNodes[0].nodeValue
+				t = type_elem.childNodes[0].nodeValue
+				m = meaning_elem.childNodes[0].nodeValue
+				definition = Definition(w, m, t)
+				self.dict.insert(random.randint(0, self.dict.length()), definition)
+			dictionary.unlink()
+			self.progress.set_fraction(0.0)
+		else:
+			print 'Dictionary file', self.file, 'not found'
+
+class ShowQuestions(threading.Thread):
+	def __init__(self, session_buffer, dictionary_buffer, ui, chose_event):
+		threading.Thread.__init__(self)
+		self.session = session_buffer
+		self.dict = dictionary_buffer
+		self.event = chose_event
+		self.ui = ui
+	def run(self):
+		counter = 0
+		while True:
+			definition = self.dict.get(counter)
+			if self.session.contains(definition.get_word()):
+				counter=counter+1
+				continue
+			random_defs = self.dict.random_sample(NUM_FAKES)
+			choices = []
+			for d in random_defs:
+				choices.append(d.meaning)
+			choices.insert(random.randint(0, len(choices)), definition.meaning)
+			self.event.clear()
+			self.ui.show_question(definition.get_word(), definition.get_type(), choices)
+			self.event.wait()
+			counter=counter+1
+
+class Test:
+	session = BufferMonitor()
+	dictionary = BufferMonitor()
+	chose_event = threading.Event()
+	radio_buttons    = []
+	invisible_button = None
+	status_label     = None
+	progress_bar     = None
+	word_type_label  = None
+	word_label       = None
+	query_box        = None
+	choices_box      = None
+	EMPTY = -1
+	TRY_AGAIN_STEP = 5
+	def __init__(self, dictionary_file):
+		gtk.gdk.threads_init()
+		if not os.path.exists(glade_file):
+			print 'Failed to open '+glade_file+'.'
+			sys.exit(1)
+		ui = gtk.glade.XML(glade_file)
+		self.choices_box     = ui.get_widget('choices')
+		self.query_box       = ui.get_widget('query')
+		self.word_type_label = ui.get_widget('word_type')
+		self.word_label      = ui.get_widget('word')
+		self.status_label    = ui.get_widget('status')
+		self.progress_bar    = ui.get_widget('progress')
+		self.word_type_label.set_text('')
+		self.word_label.set_text('')
+		self.query_box.set_sensitive(False)
+		self.choices_box.set_sensitive(False)
+		self.invisible_button = gtk.RadioButton(group=None, label='You should not see this.')
+		for i in range(0, NUM_FAKES+2):
+			rb = gtk.RadioButton(group=self.invisible_button, label='')
+			rb.connect("toggled", self._choose, i+1)
+			self.radio_buttons.append(rb)
+			self.choices_box.pack_start(rb)
+		window = ui.get_widget('window')
+		window.connect('destroy', self.exit)
+		window.show_all()
+		read_session_thread = ReadSession(session_file, self.session)
+		read_dictionary_thread = ReadDictionary(dictionary_file, self.dictionary, self.progress_bar)
+		show_questions_thread = ShowQuestions(self.session, self.dictionary, self, self.chose_event)
+		read_session_thread.start()
+		read_dictionary_thread.start()
+		show_questions_thread.start()
+		gtk.main()
+	
+	def exit(self, widget):
+		save_thread = SaveSession(gtk.main_quit, self.session)
+		save_thread.start()
+	
+	def show_question(self, word, word_type, choices):
+		self.word_type_label.set_text(word_type)
+		self.word_label.set_markup('<b>'+word+'</b>')
+		for i in range(0, len(choices)):
+			self.radio_buttons[i].set_label(choices[i])
+		self.radio_buttons[len(self.radio_buttons)-1].set_label('I don\'t know')
+		self.invisible_button.set_active(True)
+		self.query_box.set_sensitive(True)
+		self.choices_box.set_sensitive(True)
+	
+	def _choose(self, widget, choice):
+		if widget.get_active():
+			print choice
+			self.chose_event.set()
+			return
+			'''
+			mc = self.mcs[self._get_current_position()]
+			if mc.correct_answer == choice:
+				self.status_label.set_text('Correct! "'+mc.word+'" means "'+mc.meaning+'"')
+				if 0 == mc.mistakes:
+					self.learned.append(mc)
+				# We are moving away from this question, so
+				# let's forget all our misunderstandings:
+				mc.mistakes = 0
+				if self.try_again[self.position] != self.EMPTY:
+					self.try_again[self.position] = self.EMPTY
+				else:
+					self.position += 1
+				self._show_mc()
+			else:
+				self.try_again[self.position+self.TRY_AGAIN_STEP] = self._get_current_position()
+				mc.mistakes += 1
+				if choice == NUM_FAKES+2: # User clicked "I don't know"
+					self.status_label.set_text('Answer: "'+mc.word+'" means "'+mc.meaning+'"')
+					label = self.radio_buttons[mc.correct_answer-1].child
+					label.set_markup('<b>'+label.get_text()+'</b>')
+				else:
+					label = self.radio_buttons[choice-1].child
+					label.set_markup('<span strikethrough="true">'+label.get_text()+'</span>')
+			'''
+
+class SaveSession(threading.Thread):
+	def __init__(self, done_callback, session_words):
+		threading.Thread.__init__(self)
+		self.callback = done_callback
+		self.session = session_words
+	def run(self):
+		if not os.path.exists(session_file):
+			try:
+				os.makedirs(os.path.dirname(session_file))
+			except:
+				print 'Failed to create directory '+os.path.dirname(session_file)
+		try:
+			fd = open(session_file, 'w')
+			fd.write('<session>\n')
+			for i in range(0, self.session.length()):
+				fd.write('\t<learned>'+self.session.get(i).word+'</learned>\n')
+			fd.write('</session>\n')
+			fd.close()
+		except:
+			print 'Error writing', session_file
+		self.callback()
+
+class Definition:
+	def __init__(self, word, meaning, word_type=''):
+		self.word = word
+		self.meaning = meaning
+		self.word_type = word_type
+	def get_word(self):
+		return self.word
+	def get_meaning(self):
+		return self.meaning
+	def get_type(self):
+		return self.word_type
+
+if __name__ == '__main__':
+	if len(sys.argv) > 1:
+		 words_file = sys.argv[1]
+	test = Test(words_file)
